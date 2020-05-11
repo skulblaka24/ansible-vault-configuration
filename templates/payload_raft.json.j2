@@ -1,0 +1,6 @@
+{
+  "leader_api_addr": "https://{{ groups['vault_instances'][0] }}:8200",
+  "leader_ca_cert": "{{ vault_tls_keys_content.results[0].stdout }}",
+  "leader_client_cert": "{{ vault_tls_keys_content.results[1].stdout }}",
+  "leader_client_key": "{{ vault_tls_keys_content.results[2].stdout }}"
+}

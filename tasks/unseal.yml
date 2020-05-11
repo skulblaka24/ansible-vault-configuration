@@ -1,0 +1,26 @@
+---
+
+- name: Assert that the node is unsealed
+  shell: "/usr/local/bin/vault status |grep Sealed |awk '{print $2}'"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][0] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+  register: vault_status_sealed
+
+- name: Reading unseal key contents
+  command: "cat {{ item }}"
+  register: vault_unseal_keys
+  with_fileglob: "~/.unseal*"
+  when: vault_status_sealed.stdout == "true"
+
+- name: Unseal vault with unseal keys
+  shell: "/usr/local/bin/vault operator unseal {{ item.stdout }}"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][0] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+  with_items: "{{ vault_unseal_keys.results }}"
+  register: vault_unsealing_status
+  ignore_errors: no
+  when: vault_status_sealed.stdout == "true"
+
+...

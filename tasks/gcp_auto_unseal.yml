@@ -1,0 +1,26 @@
+---
+- block:
+  - name: Add the GCP kms key on the node
+    copy:
+      src: "{{ account_file_kms_path }}"
+      dest: "/etc/vault/{{ iam_kms_json_name }}.json"
+
+  - name: Add GCP auto-unseal configuration
+    lineinfile:
+      path: "/etc/vault.d/vault_main.hcl"
+      insertafter: "^plugin_directory ="
+      line: |
+      
+        seal "gcpckms" {
+          credentials = "/etc/vault/{{ iam_kms_json_name }}.json"
+          project     = "{{ project_name }}"
+          region      = "{{ region }}"
+          key_ring    = "{{ lookup('file', '/tmp/.keyring.tmp' ) | trim }}"
+          crypto_key  = "{{ gkms_vault_key }}"
+        }
+
+  become: yes
+  become_user: root
+  delegate_to: "{{ item }}"
+
+...

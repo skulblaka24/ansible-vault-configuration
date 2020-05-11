@@ -1,0 +1,229 @@
+---
+# Configure DNS
+
+- name: Get google nameserver information
+  shell: "nslookup $(cat /tmp/.ns.tmp| awk 'NR==1{print substr($1, 1, length($1)-1) }') | awk 'NR==6{print $2}'"
+  register: vault_ns
+
+- fail:
+    msg: Failed to retrieve nameserver information
+  when: vault_ns.stdout == ""
+
+- name: GCP DNS configuration
+  include: "{{ role_path }}/tasks/dns.yml"
+  with_items: "{{ groups['vault_instances'] }}"
+  when: gcp_dns_configuration == "true"
+
+
+# Auto Unseal configuration
+
+- name: Assert that the GCP kms key is created on localhost
+  stat:
+    path: "{{ account_file_kms_path }}"
+  register: vault_result_kms_key
+
+- name: Remove the old key
+  file:
+    path: "{{ account_file_kms_path }}"
+    state: absent
+  when: vault_result_kms_key.stat.exists
+
+- name: Downloading the kms key on localhost
+  shell: "{{ gcloud_bin_path }}/gcloud iam service-accounts keys create '{{ account_file_kms_path }}' --iam-account {{ iam_kms_json_name }}@{{ project_name }}.iam.gserviceaccount.com"
+  when: gcp_auto_unseal == "true"
+
+- name: Assert that auto-unseal configuration is set
+  shell: "grep seal /etc/vault.d/vault_main.hcl"
+  become: yes
+  become_user: root
+  delegate_to: "{{ groups['vault_instances'][0] }}"
+  ignore_errors: yes
+  register: vault_autounseal_configuration
+
+- name: Stop Vault Cluster to enable the seal migration
+  systemd:
+    name: "vault"
+    state: stopped
+  delegate_to: "{{ item }}"
+  with_items: "{{ groups['vault_instances'] }}"
+  become: yes
+  become_user: root
+  when: 
+    - gcp_auto_unseal == "true"
+    - vault_autounseal_configuration.rc == 1
+
+- name: GCP auto-Unseal configuration
+  include: "{{ role_path }}/tasks/gcp_auto_unseal.yml"
+  with_items: "{{ groups['vault_instances'] }}"
+  when: 
+    - gcp_auto_unseal == "true"
+    - vault_autounseal_configuration.rc == 1
+
+
+# Initializing Vault
+
+- name: Reboot immediately if there was a change.
+  shell: "sleep 1 && reboot"
+  async: 1
+  poll: 0
+  delegate_to: "{{ item }}"
+  with_items: "{{ groups['vault_instances'] }}"
+  become: yes
+  become_user: root
+  when: gcp_dns_configuration == "true"
+
+- name: Wait for the reboot to complete if there was a change.
+  wait_for_connection:
+    connect_timeout: 20
+    sleep: 5
+    delay: 5
+    timeout: 300
+  delegate_to: "{{ item }}"
+  with_items: "{{ groups['vault_instances'] }}"
+  become: yes
+  become_user: root
+  when: gcp_dns_configuration == "true"
+
+- name: Start all vault nodes to make sure they are ready
+  systemd:
+    name: "vault"
+    state: started
+  delegate_to: "{{ item }}"
+  with_items: "{{ groups['vault_instances'] }}"
+  become: yes
+  become_user: root
+
+- name: Install Vault certificate on localhost
+  copy:
+    src: "{{ vault_tls_src_files }}/{{ item.src }}"
+    dest: "/tmp/{{ item.dest }}"
+    mode: "0644"
+  with_items:
+    - { src: "{{ vault_cacert }}", dest: "{{ vault_cacert }}" }
+    - { src: "{{ vault_cert }}", dest: "{{ vault_cert }}" }
+    - { src: "{{ vault_key }}", dest: "{{ vault_key }}" }
+
+- name: Vault API reachable?
+  uri:
+    validate_certs: "true"
+    url: "https://{{ groups['vault_instances'][0] }}:8200/v1/sys/health"
+    method: GET
+    # 200 if initialized, unsealed, and active
+    # 429 if unsealed and standby
+    # 472 if data recovery mode replication secondary and active
+    # 473 if performance standby
+    # 501 if not initialized
+    # 503 if sealed
+    # See: https://www.vaultproject.io/api/system/health.html
+    status_code: 200, 429, 473, 501, 503
+    body_format: json
+  register: check_result
+  retries: 6
+  until: check_result is succeeded
+  delay: 10
+  changed_when: false
+
+- name: Check if Vault is already initialized
+  shell: "/usr/local/bin/vault status |grep Initialized |awk '{print $2}'"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][0] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+  register: vault_status_initialized
+
+- name: Initializing node 1 to start configuring the cluster
+  include: "{{ role_path }}/tasks/init.yml"
+  when: 
+    - gcp_auto_unseal != "true"
+    - vault_status_initialized.stdout == "false"
+
+- name: Initializing node 1 to start configuring the cluster
+  include: "{{ role_path }}/tasks/init-autounseal.yml"
+  when: 
+    - gcp_auto_unseal == "true"
+    - vault_status_initialized.stdout == "false"
+
+- name: Read Vault root token
+  set_fact:
+    vault_root_token: "{{ lookup('file', '~/.rootkey') }}"
+  no_log: yes
+
+
+# Unsealing Vault
+
+- name: Unsealing node 1 to start configuring the cluster
+  include: "{{ role_path }}/tasks/unseal.yml"
+  when: gcp_auto_unseal != "true"
+
+# Pause to wait for the node to be back online
+- pause:
+    seconds: 5
+  when: gcp_auto_unseal != "true"
+
+- name: Assert that the node is unsealed
+  shell: "/usr/local/bin/vault status |grep Sealed |awk '{print $2}'"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][0] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+  register: vault_status_unsealed
+
+- fail:
+    msg: "The cluster is still sealed, abording"
+  when: vault_status_unsealed.stdout == "true"
+
+
+# Configuring License
+
+- name: Installing license
+  include: "{{ role_path }}/tasks/license.yml"
+
+
+# Generating payload for raft registering
+
+- name: Reading Certificate keys as one line
+  shell: "awk 'NF {sub(/\\r/, \"\"); printf \"%s\\\\n\",$0;}' {{ item }}"
+  loop:
+    - "/tmp/{{ vault_cacert }}"
+    - "/tmp/{{ vault_cert }}"
+    - "/tmp/{{ vault_key }}" 
+  register: vault_tls_keys_content
+
+- name: Setting up payload to register raft cluster
+  template:
+    src: "payload_raft.json.j2"
+    dest: "/tmp/payload_raft.json"
+
+
+# Enroll node 2
+
+- name: Enrolling Vault Node 2
+  include: "{{ role_path }}/tasks/enroll_node2.yml"
+
+
+# Enroll node 3
+
+- name: Enrolling Vault Node 3
+  include: "{{ role_path }}/tasks/enroll_node3.yml"
+
+
+# - name: Configure Cluster
+#   terraform:
+#     project_path: '../terraform/'
+#     state: "present"
+#     force_init: true
+#     backend_config:
+#       region: "europe-west1"
+#       region_zone: "europe-west1-c"
+#       project_name: "starfly"
+#       account_file_path: "../keys/starfly-gcp.json"
+#       image: "debian-cloud/debian-9"
+#       gcp_dns_zone: "starfly"
+#       gcp_dns_domain: "starfly.fr."
+#       starfly_ip: "82.64.201.67"
+#       ssh_user: "master"
+#       ssh_pub_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILBd8AerMuCVlT1ERPifxLdJ4ctQATQX6XMrzpQLK1kf master@starfly.fr"
+#       activate_gkms: "false"
+#       activate_dns: "false"
+#       node_count: "3"
+#   when: false
+
+...

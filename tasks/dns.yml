@@ -1,0 +1,45 @@
+---
+- block:
+  - name: Assert that dns is already present or not 
+    shell: "grep {{ vault_ns.stdout }} /etc/resolv.conf"
+    ignore_errors: yes
+    register: vault_dns_configuration
+
+  - name: Assert that dhcp is already present or not 
+    shell: "grep {{ vault_ns.stdout }} /etc/dhcp/dhclient.conf"
+    ignore_errors: yes
+    register: vault_dhcp_configuration
+
+  - name: Configure Google DNS on DHCP configuration to append the right line
+    lineinfile:
+      path: "/etc/dhcp/dhclient.conf"
+      line: |
+        append domain-search "starfly.fr";
+        prepend domain-name-servers {{ vault_ns.stdout }} ;
+        prepend domain-name-servers 8.8.8.8 ;
+      insertbefore: "^#send dhcp-c"
+    when: vault_dhcp_configuration.rc == 1
+
+  - name: Reset DHCP configuration
+    shell: "dhclient -v -r"
+    when: vault_dns_configuration.rc == 1
+
+  - name: Remove a line from the file
+    lineinfile:
+      path: "/etc/resolv.conf"
+      regexp: "^nameserver"
+      state: absent
+    when: vault_dns_configuration.rc == 1
+
+  - name: Configure Google DNS
+    lineinfile:
+      path: "/etc/resolv.conf"
+      line: |
+        nameserver {{ vault_ns.stdout }}
+        nameserver 8.8.8.8
+    when: vault_dns_configuration.rc == 1
+
+  become: yes
+  become_user: root
+  delegate_to: "{{ item }}"
+...

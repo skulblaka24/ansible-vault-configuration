@@ -1,0 +1,27 @@
+---
+
+- name: Initialise Vault operator
+  shell: "/usr/local/bin/vault operator init -recovery-shares=5 -recovery-threshold=3 -format json"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][0] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+  no_log: yes
+  register: vault_init_results
+
+- name: Parse output of vault init
+  set_fact:
+    vault_init_parsed: "{{ vault_init_results.stdout | from_json }}"
+  no_log: yes
+
+- name: Write recovery keys to files
+  copy:
+    dest: "~/.unseal_key_{{ item.0 }}"
+    content: "{{ item.1 }}"
+  with_indexed_items: "{{ vault_init_parsed.recovery_keys_hex }}"
+
+- name: Write root token to file
+  copy:
+    content: "{{ vault_init_parsed.root_token }}"
+    dest: "~/.rootkey"
+
+...

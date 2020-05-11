@@ -1,0 +1,88 @@
+---
+- name: Vault node 3 API reachable?
+  uri:
+    validate_certs: "true"
+    url: "https://{{ groups['vault_instances'][2] }}:8200/v1/sys/health"
+    method: GET
+    # 200 if initialized, unsealed, and active
+    # 429 if unsealed and standby
+    # 472 if data recovery mode replication secondary and active
+    # 473 if performance standby
+    # 501 if not initialized
+    # 503 if sealed
+    # See: https://www.vaultproject.io/api/system/health.html
+    status_code: 200, 429, 473, 501, 503
+    body_format: json
+  register: check_result
+  retries: 6
+  until: check_result is succeeded
+  delay: 10
+  changed_when: false
+
+- name: Assert that node 3 is in the cluster
+  shell: "/usr/local/bin/vault operator raft list-peers| grep node3|awk '{print $1}'"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][0] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+    VAULT_TOKEN: "{{ vault_root_token }}"
+  register: vault_raft_node3
+
+- name: Assert that node 3 is not initialized
+  shell: "/usr/local/bin/vault status |grep Initialized |awk '{print $2}'"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][2] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+  register: vault_status_node3_init
+
+- name: Adding node 3 to cluster
+  uri:
+    url: "https://{{ groups['vault_instances'][2] }}:8200/v1/sys/storage/raft/join"
+    method: POST
+    body: "{{ lookup('file','/tmp/payload_raft.json') }}"
+    body_format: json
+    headers:
+      X-Vault-Token: "{{ vault_root_token }}"
+  when: 
+    - vault_status_node3_init.stdout == "false"
+    - vault_raft_node3.stdout == ""
+
+# Unsealing when auto unseal n'est pas configuré
+
+- name: Assert that node 3 is not initialized
+  shell: "/usr/local/bin/vault status |grep Initialized |awk '{print $2}'"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][2] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+  register: vault_status_node3_init2
+
+- name: Assert that the node 3 is unsealed
+  shell: "/usr/local/bin/vault status |grep Sealed |awk '{print $2}'"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][1] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+  register: vault_status_sealed3
+  when: vault_status_node3_init2.stdout == "true"
+
+- name: Reading unseal key contents
+  command: "cat {{ item }}"
+  register: vault_unseal_keys
+  with_fileglob: "~/.unseal*"
+  when: 
+    - gcp_auto_unseal != "true"
+    - vault_status_sealed3.stdout == "true"
+    - vault_status_node3_init2.stdout == "true"
+
+- name: Unseal vault with unseal keys
+  shell: "/usr/local/bin/vault operator unseal {{ item.stdout }}"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][2] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+  with_items: "{{ vault_unseal_keys.results }}"
+  register: vault_unsealing_status
+  ignore_errors: yes
+  when: 
+    - gcp_auto_unseal != "true"
+    - vault_status_sealed3.stdout == "true"
+    - vault_status_node3_init2.stdout == "true"
+
+...

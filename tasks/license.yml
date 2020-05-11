@@ -1,0 +1,29 @@
+---
+- name: Assert that Cluster is ready
+  shell: "/usr/local/bin/vault status|grep \"HA Mode\"|awk '{print $3}'"
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][0] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+  register: vault_status_ready
+
+- name: Add an extra pause if not
+  pause:
+    seconds: 20
+  when: 
+    - vault_status_ready.stdout != "active"
+    - vault_status_unsealed.stdout == "false"
+
+- name: Read License file
+  set_fact:
+    vault_license_content: "{{ lookup('file', '{{ licensing_file_path }}') }}"
+  no_log: yes
+
+- name: Install Vault License
+  shell: '/usr/local/bin/vault write sys/license text="{{ vault_license_content }}"'
+  environment:
+    VAULT_ADDR: "https://{{ groups['vault_instances'][0] }}:8200"
+    VAULT_CACERT: "/tmp/{{ vault_cacert }}"
+    VAULT_TOKEN: "{{ vault_root_token }}"
+  no_log: yes
+
+...
